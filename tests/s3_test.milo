@@ -141,6 +141,18 @@ fn testListObjectsRespectsPrefix(): void {
     assertTrue(all.len() >= 3)
 }
 
+// The continuation-token loop, forced with a one-key page instead of the
+// thousand objects it would otherwise take. A client that ignored IsTruncated
+// would return 1 here and look perfectly plausible doing it.
+fn testListObjectsPaginates(): void {
+    var s3 = client()
+    s3.putObject(bucket(), "paged/1.txt", "a", "text/plain")!
+    s3.putObject(bucket(), "paged/2.txt", "b", "text/plain")!
+    s3.putObject(bucket(), "paged/3.txt", "c", "text/plain")!
+    s3.setPageSize(1)
+    assertEqual64(s3.listObjectsV2(bucket(), "paged/")!.len(), 3)
+}
+
 fn testDeleteRemovesObject(): void {
     let s3 = client()
     let key = "delete/gone.txt"

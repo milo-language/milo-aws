@@ -122,6 +122,11 @@ A session token is not decoration. When one is present it is sent as
 the usual reason temporary credentials "do not work". `sign` does both, so you
 cannot forget.
 
+`listObjectsV2` follows continuation tokens to the end, so it returns everything
+under the prefix rather than S3's first 1000 keys. `s3.setPageSize(n)` changes the
+page size — mainly so the continuation loop is testable against three objects
+instead of a thousand.
+
 ## Errors
 
 `AwsError` keeps S3's own code:

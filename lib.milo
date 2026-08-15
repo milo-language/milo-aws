@@ -1090,6 +1090,11 @@ pub struct S3 {
     endpoint: string,
     region: string,
     creds: Credentials,
+    // Keys per ListObjectsV2 page. S3's own cap is 1000 and that is the default;
+    // it is settable so the continuation-token loop can be exercised against a
+    // handful of objects instead of a thousand. Untested pagination is how a
+    // client comes to return a short list that looks exactly like a correct one.
+    pageSize: i64,
 }
 
 impl S3 {
@@ -1099,8 +1104,12 @@ impl S3 {
             e = e.substr(0, e.len - 1)
         }
         return S3 {
-            endpoint: e, region: region.clone(), creds: creds
+            endpoint: e, region: region.clone(), creds: creds, pageSize: 1000
         }
+    }
+
+    fn setPageSize(self: &mut Self, n: i64): void {
+        self.pageSize = n
     }
 
     fn objectUrl(self: &Self, bucket: &string, key: &string): string {
@@ -1213,6 +1222,7 @@ impl S3 {
         while more {
             var req = Request.forS3("GET", self.bucketUrl(bucket))
             req.addQuery("list-type", "2")
+            req.addQuery("max-keys", self.pageSize.toString())
             if prefix.len > 0 {
                 req.addQuery("prefix", prefix)
             }
