@@ -1,0 +1,29 @@
+// SigV4 against AWS's documented get-vanilla vector, to prove std's crypto
+// composes correctly before writing an AWS package. Same method that de-risked
+// SCRAM for the postgres client: verify the derivation chain against an
+// independent implementation first.
+from "std/hmac" import { Hmac }
+from "std/sha256" import { Sha256 }
+
+fn main(): i32 {
+    let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+    let date = "20150830"
+    let region = "us-east-1"
+    let service = "service"
+    let amzdate = "20150830T123600Z"
+
+    let canonical = "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:" + amzdate + "\n\nhost;x-amz-date\n" + Sha256.hash("")
+    print("canonical_sha: " + Sha256.hash(canonical))
+
+    let scope = date + "/" + region + "/" + service + "/aws4_request"
+    let sts = "AWS4-HMAC-SHA256\n" + amzdate + "\n" + scope + "\n" + Sha256.hash(canonical)
+
+    // The key derivation chain: each step keys the next HMAC with the previous
+    // raw digest, never the hex — hexing an intermediate is the classic SigV4 bug.
+    var k = Hmac.sha256Bytes("AWS4" + secret, date)
+    k = Hmac.sha256Bytes(k, region)
+    k = Hmac.sha256Bytes(k, service)
+    k = Hmac.sha256Bytes(k, "aws4_request")
+    print("signature:     " + Hmac.sha256(k, sts))
+    return 0
+}

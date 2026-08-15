@@ -1,0 +1,10 @@
+{
+  "name": "aws",
+  "version": "0.1.0",
+  "description": "AWS SigV4 request signing and an S3 client, pure Milo",
+  "license": "MIT",
+  "repository": "github.com/milo-language/milo-aws",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux"],
+  "exclude": ["tests/**", "examples/**", "scripts/**", "docs/**"]
+}

@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install milo
+        run: |
+          mkdir -p "$HOME/.milo-bin"
+          curl -fsSL https://github.com/milo-language/milo/releases/download/latest/milo-linux-x64.tar.gz \
+            | tar xz -C "$HOME/.milo-bin" --strip-components=1   # archive wraps the binary in milo-<platform>/
+          chmod +x "$HOME/.milo-bin/milo"
+          echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
+
+      - name: Unit tests
+        run: milo test tests/yaml_test.milo
+
+      - name: Differential test against ruamel.yaml
+        run: |
+          pip install ruamel.yaml
+          python3 scripts/oracle.py --milo "$(command -v milo)"
+
+      - name: Example
+        run: milo run examples/config.milo examples/app.yaml
