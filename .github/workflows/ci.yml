@@ -45,26 +45,15 @@ jobs:
   s3:
     runs-on: ubuntu-latest
 
-    services:
-      minio:
-        # bitnami's image, not minio/minio, because GitHub's `services:` block
-        # has no way to pass command arguments to a container — `options` maps
-        # onto docker create flags — and minio/minio's entrypoint needs
-        # `server /data`. bitnami's starts the server from env alone.
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: miniotestkey
-          MINIO_ROOT_PASSWORD: miniotestsecret
-        # Mapped to port 80 on purpose. The released milo's std/fetch omits the
-        # port from the Host header (fixed upstream, not yet in a release), and
-        # testPresignedGetWorksWithPlainFetch fetches through std/fetch. On the
-        # default port both spellings of Host agree, so this job tests the client
-        # rather than the transport's version. The signer's own port handling is
-        # covered with no server at all by testHostHeaderCarriesNonDefaultPort.
-        ports:
-          - 80:9000
-
     env:
+      # Port 80 on purpose. The pinned milo release's std/fetch builds its Host
+      # header without the port (RFC 7230 5.4 requires it; fixed upstream after
+      # that release), and testPresignedGetWorksWithPlainFetch fetches through
+      # std/fetch — on a non-default port the Host it sends disagrees with the
+      # Host the URL was signed for, and MinIO rightly refuses it. On the default
+      # port both spellings agree, so this job tests the client rather than the
+      # transport's version. The signer's own port handling is covered with no
+      # server at all by testHostHeaderCarriesNonDefaultPort.
       MILO_S3_ENDPOINT: http://127.0.0.1
       MILO_S3_KEY: miniotestkey
       MILO_S3_SECRET: miniotestsecret
@@ -80,16 +69,24 @@ jobs:
           chmod +x "$HOME/.milo-bin/milo"
           echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
 
-      # Checked, not slept. A fixed sleep races a loaded runner, and a wait with
-      # no check is the silent-success trap: it would "succeed" against a dead
-      # server and every test below would then fail for the wrong reason.
-      - name: Wait for MinIO
+      # Run from the released binary rather than a `services:` container: that
+      # block has no way to pass command arguments (`options` maps onto docker
+      # create flags), and minio/minio's entrypoint needs `server /data`.
+      # Readiness is CHECKED, not slept — a fixed sleep races a loaded runner,
+      # and a wait with no check is the silent-success trap: it would "succeed"
+      # against a dead server and every test below would fail for the wrong
+      # reason.
+      - name: Start MinIO
         run: |
-          for i in $(seq 1 100); do
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /tmp/minio
+          chmod +x /tmp/minio
+          sudo env MINIO_ROOT_USER=miniotestkey MINIO_ROOT_PASSWORD=miniotestsecret \
+            /tmp/minio server /tmp/minio-data --address 127.0.0.1:80 > /tmp/minio.log 2>&1 &
+          for i in $(seq 1 60); do
             curl -fsS http://127.0.0.1/minio/health/live >/dev/null 2>&1 && exit 0
             sleep 1
           done
-          echo "minio never became ready"; exit 1
+          echo "minio never became ready"; cat /tmp/minio.log; exit 1
 
       - name: S3 tests
         run: milo test tests/s3_test.milo
