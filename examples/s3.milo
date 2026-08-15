@@ -1,0 +1,85 @@
+// A full S3 round trip: create, put, head, list, presign, get, delete.
+//
+// Points at the throwaway MinIO from scripts/test-server.sh by default, so it
+// runs with no AWS account:
+//
+//   sh scripts/test-server.sh start
+//   AWS_ACCESS_KEY_ID=miniotestkey AWS_SECRET_ACCESS_KEY=miniotestsecret \
+//     milo run examples/s3.milo
+//   sh scripts/test-server.sh stop
+//
+// Against real AWS, set the endpoint and region and let credentials resolve from
+// the environment or ~/.aws/credentials:
+//
+//   AWS_PROFILE=work MILO_S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com \
+//   MILO_S3_REGION=eu-west-1 milo run examples/s3.milo
+from "../lib" import {
+    AwsError, Credentials, S3, amzNow
+}
+from "std/env" import {
+    Env
+}
+
+fn main(): i32 {
+    let endpoint = Env.getOr("MILO_S3_ENDPOINT", "http://127.0.0.1:59000")
+    let region = Env.getOr("MILO_S3_REGION", "us-east-1")
+    let bucket = Env.getOr("MILO_S3_BUCKET", "milo-aws-example")
+
+    // The documented resolution chain: environment first, then the AWS_PROFILE
+    // section of ~/.aws/credentials. A program that wants to pass keys in
+    // directly builds a Credentials itself and never calls this.
+    var creds = Credentials.make("", "")
+    match Credentials.resolve() {
+        Result.Ok(c) => {
+            creds = c
+        }
+        Result.Err(e) => {
+            print("no credentials: " + e.toString())
+            return 1
+        }
+    }
+
+    let s3 = S3.new(endpoint, region, creds)
+
+    match run(s3, bucket) {
+        Result.Ok(u) => {
+            print("done")
+            return 0
+        }
+        Result.Err(e) => {
+            print("failed: " + e.toString())
+            return 1
+        }
+    }
+}
+
+// Everything that can fail lives here so `?` can carry the error out in one
+// piece, instead of main growing a match per call.
+fn run(s3: &S3, bucket: &string): Result<Unit, AwsError> {
+    s3.createBucket(bucket)?
+    print("bucket " + bucket + " exists: " + s3.bucketExists(bucket)?.toString())
+
+    s3.putObject(bucket, "notes/hello.txt", "hello from milo\n", "text/plain")?
+    s3.putObject(bucket, "notes/second.txt", "another object\n", "text/plain")?
+    s3.putObject(bucket, "other/skip.txt", "not in the listing\n", "text/plain")?
+    print("put 3 objects")
+
+    let meta = s3.headObject(bucket, "notes/hello.txt")?
+    print("head: " + meta.toString())
+
+    for m in s3.listObjectsV2(bucket, "notes/")? {
+        print("  listed " + m.key + " " + m.size.toString() + " bytes")
+    }
+
+    print("get: " + s3.getObject(bucket, "notes/hello.txt")?.trim())
+
+    // A URL anyone can GET for the next five minutes, with no credentials on it.
+    let url = s3.presignGet(bucket, "notes/hello.txt", 300, amzNow())
+    print("presigned: " + url)
+
+    s3.deleteObject(bucket, "other/skip.txt")?
+    print("deleted other/skip.txt")
+    return Result.Ok(Unit {
+    }
+    )
+}

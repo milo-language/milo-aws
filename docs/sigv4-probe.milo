@@ -2,8 +2,12 @@
 // composes correctly before writing an AWS package. Same method that de-risked
 // SCRAM for the postgres client: verify the derivation chain against an
 // independent implementation first.
-from "std/hmac" import { Hmac }
-from "std/sha256" import { Sha256 }
+from "std/hmac" import {
+    Hmac
+}
+from "std/sha256" import {
+    Sha256
+}
 
 fn main(): i32 {
     let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"

@@ -1,0 +1,218 @@
+// S3 client tests against a real server.
+//
+// They need MinIO, which validates SigV4 for real — a hand-rolled fake would
+// accept whatever signature the client produced and prove nothing about signing.
+// `sh scripts/run-tests.sh` brings one up, runs this, and tears it down.
+//
+// testSigningIsActuallyChecked is the negative control for the server half: a
+// wrong secret must be REFUSED. Without it this whole file would be green against
+// a server that ignored the signature entirely.
+from "../lib" import {
+    AwsError, Credentials, ObjectMeta, S3, amzNow
+}
+from "std/env" import {
+    Env
+}
+from "std/fetch" import {
+    fetch
+}
+from "std/testing" import {
+    assertEqual, assertEqual64, assertFalse, assertMsg, assertStrEqual, assertTrue
+}
+
+// ── S3 against MinIO ─────────────────────────────────────────────────────────
+
+fn endpoint(): string {
+    return Env.getOr("MILO_S3_ENDPOINT", "http://127.0.0.1:59000")
+}
+
+fn bucket(): string {
+    return Env.getOr("MILO_S3_BUCKET", "milo-aws-test")
+}
+
+// Every test runs in its own process, so each one opens its own client and
+// creates the bucket. createBucket is idempotent (BucketAlreadyOwnedByYou is the
+// state the caller asked for), which is what makes that safe under the parallel
+// runner. Keys are prefixed per test rather than cleared wholesale, so no test
+// can delete another's objects mid-run.
+fn client(): S3 {
+    let c = Credentials.make(Env.getOr("MILO_S3_KEY", "miniotestkey"), Env.getOr("MILO_S3_SECRET", "miniotestsecret"))
+    let s3 = S3.new(endpoint(), Env.getOr("MILO_S3_REGION", "us-east-1"), c)
+    match s3.createBucket(bucket()) {
+        Result.Ok(u) => {
+        }
+        Result.Err(e) => {
+            assertMsg(false, "createBucket failed: " + e.toString())
+        }
+    }
+    return s3
+}
+
+fn testCreateBucketAndExists(): void {
+    let s3 = client()
+    assertTrue(s3.bucketExists(bucket())!)
+    assertFalse(s3.bucketExists("milo-aws-no-such-bucket-9f3a")!)
+}
+
+fn testPutGetRoundTrip(): void {
+    let s3 = client()
+    let key = "roundtrip/hello.txt"
+    let body = "hello from milo\n"
+    s3.putObject(bucket(), key, body, "text/plain")!
+    assertStrEqual(s3.getObject(bucket(), key)!, body)
+}
+
+// The interesting round trip: S3 stores bytes, and Milo's string is an owned byte
+// buffer, so a NUL or a 0xff in the middle must survive both ways. A client that
+// treated the body as C text would truncate here and nowhere else.
+fn testBinaryRoundTrip(): void {
+    let s3 = client()
+    let key = "roundtrip/binary.bin"
+    var body: string = ""
+    body.pushStr("head")
+    body.push(0 as u8)
+    body.push(255 as u8)
+    body.push(0 as u8)
+    body.pushStr("tail")
+    body.push(13 as u8)
+    body.push(10 as u8)
+    s3.putObject(bucket(), key, body, "application/octet-stream")!
+    let got = s3.getObject(bucket(), key)!
+    assertEqual64(got.len, body.len)
+    assertTrue(got == body)
+    // Spelled out so a length-only pass cannot hide a mangled middle:
+    // "head" + NUL + 0xff + NUL + "tail" + CR + LF is 13 bytes.
+    assertEqual64(got.len, 13)
+    assertEqual64(got[4] as i64, 0)
+    assertEqual64(got[5] as i64, 255)
+    assertEqual64(got[6] as i64, 0)
+    assertEqual64(got[12] as i64, 10)
+}
+
+fn testHeadObjectReportsSizeAndEtag(): void {
+    let s3 = client()
+    let key = "head/meta.txt"
+    let body = "0123456789"
+    s3.putObject(bucket(), key, body, "text/plain")!
+    let meta = s3.headObject(bucket(), key)!
+    assertEqual64(meta.size, 10)
+    // The ETag of a single-part upload is the MD5 of the body, so it is a fixed
+    // value an independent tool can confirm: `md5 -q` / `md5sum` agree.
+    assertStrEqual(meta.etag, "781e5e245d69b566979b86e28d23f2c7")
+    assertStrEqual(meta.contentType, "text/plain")
+}
+
+fn testListObjectsRespectsPrefix(): void {
+    let s3 = client()
+    s3.putObject(bucket(), "listing/a.txt", "a", "text/plain")!
+    s3.putObject(bucket(), "listing/b.txt", "bb", "text/plain")!
+    s3.putObject(bucket(), "other/c.txt", "ccc", "text/plain")!
+
+    let listed = s3.listObjectsV2(bucket(), "listing/")!
+    assertEqual64(listed.len(), 2)
+    var names: Vec<string> = []
+    var sizes: i64 = 0
+    for m in listed {
+        names.push(m.key.clone())
+        sizes = sizes + m.size
+    }
+    names.sort()
+    assertStrEqual(names[0], "listing/a.txt")
+    assertStrEqual(names[1], "listing/b.txt")
+    assertEqual64(sizes, 3)
+
+    // The ETag comes out of the XML, where S3 writes it with its quotes escaped
+    // as &quot;. Asserting the md5 of the body checks the unescape and the
+    // quote-stripping at once — a listing that returned `&quot;0cc…&quot;` would
+    // still have looked like a plausible etag.
+    var etag: string = ""
+    for m in listed {
+        if m.key == "listing/a.txt" {
+            etag = m.etag.clone()
+        }
+    }
+    // Asserted outside the loop on purpose: an `if` inside it would pass
+    // silently on a listing that never mentioned the key at all.
+    assertStrEqual(etag, "0cc175b9c0f1b6a831c399e269772661")
+
+    // An empty prefix lists the bucket, which must include what a prefixed list
+    // excluded — otherwise "respects prefix" could be "returns nothing".
+    let all = s3.listObjectsV2(bucket(), "")!
+    assertTrue(all.len() >= 3)
+}
+
+fn testDeleteRemovesObject(): void {
+    let s3 = client()
+    let key = "delete/gone.txt"
+    s3.putObject(bucket(), key, "temporary", "text/plain")!
+    assertStrEqual(s3.getObject(bucket(), key)!, "temporary")
+    s3.deleteObject(bucket(), key)!
+    match s3.getObject(bucket(), key) {
+        Result.Ok(v) => {
+            assertMsg(false, "the object is still there after DELETE")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "NoSuchKey")
+        }
+    }
+}
+
+// A missing key is a typed error carrying S3's own code, not a bare string. A
+// caller has to be able to tell "not there" from "the network broke" without
+// matching on prose.
+fn testMissingKeyIsTypedError(): void {
+    let s3 = client()
+    match s3.getObject(bucket(), "missing/definitely-not-here.txt") {
+        Result.Ok(v) => {
+            assertMsg(false, "expected an error for a missing key")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.kind, "S3")
+            assertStrEqual(e.code, "NoSuchKey")
+            assertEqual(e.status, 404)
+            assertTrue(e.isNotFound())
+        }
+    }
+}
+
+fn testSigningIsActuallyChecked(): void {
+    // The negative control for the server half: MinIO validates SigV4 for real,
+    // so a wrong secret must be refused. Without this the S3 tests would pass
+    // against a server that ignored the signature entirely.
+    let bad = Credentials.make(Env.getOr("MILO_S3_KEY", "miniotestkey"), "definitely-the-wrong-secret")
+    let s3 = S3.new(endpoint(), Env.getOr("MILO_S3_REGION", "us-east-1"), bad)
+    match s3.listObjectsV2(bucket(), "") {
+        Result.Ok(v) => {
+            assertMsg(false, "the server accepted a request signed with the wrong secret")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "SignatureDoesNotMatch")
+        }
+    }
+}
+
+// The proof that a presigned URL is a real URL: it is fetched with std/fetch,
+// which knows nothing about this package. No Authorization header, no signing
+// code in the loop — just a GET.
+fn testPresignedGetWorksWithPlainFetch(): void {
+    let s3 = client()
+    let key = "presign/public.txt"
+    let body = "anyone with the link"
+    s3.putObject(bucket(), key, body, "text/plain")!
+    let url = s3.presignGet(bucket(), key, 300, amzNow())
+
+    let resp = fetch(url)!
+    assertEqual(resp.status, 200)
+    assertStrEqual(resp.body, body)
+
+    // Corrupt the signature and the same URL must stop working, or the test
+    // above would pass against a server that ignored the query entirely.
+    let tampered = url.substr(0, url.len - 1) + (if url.endsWith("a") {
+        "b"
+    } else {
+        "a"
+    }
+    )
+    let bad = fetch(tampered)!
+    assertEqual(bad.status, 403)
+}

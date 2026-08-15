@@ -1,0 +1,270 @@
+// SigV4 signing tests. NO SERVER — this is the half that matters and the half
+// that runs anywhere.
+//
+// A signature is a pure function of its inputs, so it is checkable against fixed
+// vectors with no network and no AWS account. Every expected signature below was
+// produced by scripts/sigv4-oracle.py, an independent implementation written from
+// AWS's spec on top of Python's hmac/hashlib — and its `get-vanilla` case is
+// checked against AWS's own published value before it prints anything.
+// scripts/run-tests.sh re-runs the oracle and greps every signature it prints out
+// of THIS file, so a drift between the two fails the gate instead of leaving
+// stale constants here.
+//
+// testBadSecretChangesSignature and testBadPathChangesSignature are the negative
+// controls. Without them a signer that returned a constant would pass every
+// positive case above.
+from "../lib" import {
+    Credentials, Request, SignedRequest, canonicalQuery, presign, sign, unsignedPayload,
+    uriDecode, uriEncode
+}
+from "std/env" import {
+    Env
+}
+from "std/fs" import {
+    writeFile, removeFile, makeTempDir
+}
+from "std/testing" import {
+    assertContains, assertFalse, assertStrEqual, assertTrue
+}
+
+// ── Fixtures ─────────────────────────────────────────────────────────────────
+
+// AWS's own documented example credentials and timestamp.
+fn ak(): string {
+    return "AKIDEXAMPLE"
+}
+
+fn sk(): string {
+    return "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+}
+
+fn stamp(): string {
+    return "20150830T123600Z"
+}
+
+fn region(): string {
+    return "us-east-1"
+}
+
+fn creds(): Credentials {
+    return Credentials.make(ak(), sk())
+}
+
+// The hex signature out of an Authorization header.
+fn signatureOf(sr: &SignedRequest): string {
+    let auth = sr.header("authorization") ?? ""
+    let i = auth.indexOf("Signature=") ?? -1
+    if i < 0 {
+        return ""
+    }
+    return auth.substr(i + 10, auth.len)
+}
+
+fn signedHeadersOf(sr: &SignedRequest): string {
+    let auth = sr.header("authorization") ?? ""
+    let a = auth.indexOf("SignedHeaders=") ?? -1
+    let b = auth.indexOf(", Signature=") ?? -1
+    if a < 0 || b < 0 {
+        return ""
+    }
+    return auth.substr(a + 14, b)
+}
+
+fn signatureOfUrl(url: &string): string {
+    let i = url.indexOf("X-Amz-Signature=") ?? -1
+    if i < 0 {
+        return ""
+    }
+    return url.substr(i + 16, url.len)
+}
+
+// ── Signer: AWS's published vector ───────────────────────────────────────────
+
+// oracle: case=get-vanilla. This is AWS's own worked example, so it pins the
+// whole chain — canonical request, string to sign, key derivation — to a value
+// neither this package nor the oracle invented.
+fn testGetVanilla(): void {
+    let req = Request.new("GET", "https://example.amazonaws.com/")
+    let signed = sign(req, creds(), region(), "service", stamp())
+    assertStrEqual(signatureOf(signed), "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+    assertStrEqual(signedHeadersOf(signed), "host;x-amz-date")
+    assertContains(signed.header("authorization") ?? "", "Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request")
+}
+
+// ── Signer: canonicalisation ─────────────────────────────────────────────────
+
+// oracle: case=query-sort. Duplicate names out of order, an empty value that
+// still needs its '=', a space, and slashes that must survive as %2F.
+fn testQueryStringSortingAndEncoding(): void {
+    var req = Request.forS3("GET", "https://s3.example.com/bucket")
+    req.addQuery("prefix", "a/b")
+    req.addQuery("delimiter", "/")
+    req.addQuery("marker", "key with spaces")
+    req.addQuery("a", "2")
+    req.addQuery("a", "1")
+    req.addQuery("empty", "")
+    assertStrEqual(canonicalQuery(req.query), "a=1&a=2&delimiter=%2F&empty=&marker=key%20with%20spaces&prefix=a%2Fb")
+    let signed = sign(req, creds(), region(), "s3", stamp())
+    assertStrEqual(signatureOf(signed), "500aa0f5610fc0b2a09d294275425fd1d6f9094cf3c72a7d86dee4c19ee0ab22")
+}
+
+// oracle: case=header-collapse. Leading/trailing space stripped, internal runs
+// collapsed to one space, names lowercased and reordered.
+fn testHeaderWhitespaceCollapsing(): void {
+    var req = Request.forS3("PUT", "https://s3.example.com/bucket/obj")
+    req.setHeader("X-Amz-Meta-Note", "  hello   world  ")
+    req.setHeader("Content-Type", "text/plain")
+    req.setHeader("X-Amz-Meta-Alpha", "one")
+    req.setBody("hello")
+    let signed = sign(req, creds(), region(), "s3", stamp())
+    assertStrEqual(signatureOf(signed), "11c4809d1d66a7056b7cba1666f7772df327f6eef04627d0be34a78bdecc254c")
+    assertStrEqual(signedHeadersOf(signed), "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-alpha;x-amz-meta-note")
+    // The header that goes on the wire is the normalised one, not the original.
+    assertStrEqual(signed.header("x-amz-meta-note") ?? "", "hello world")
+}
+
+// oracle: case=s3-path-single and case=path-double. The SAME literal path, under
+// the two rules. They must not agree: S3 encodes the path once, every other
+// service twice, and a client that double-encodes for S3 gets
+// SignatureDoesNotMatch with no clue why.
+fn testS3PathIsEncodedOnceAndOthersTwice(): void {
+    let url = "https://s3.example.com/bucket/docs/a b+c~d.txt"
+
+    let s3req = Request.forS3("GET", url)
+    let s3signed = sign(s3req, creds(), region(), "s3", stamp())
+    assertStrEqual(signatureOf(s3signed), "25b7192b285d89caa3d14c17f86ee490e792c5f8bcfdc1d333df25726163d6ae")
+    // Single encoding: space -> %20, '+' -> %2B, '~' left alone, '%' never doubled.
+    assertStrEqual(s3signed.url, "https://s3.example.com/bucket/docs/a%20b%2Bc~d.txt")
+
+    let other = Request.new("GET", url)
+    let otherSigned = sign(other, creds(), region(), "service", stamp())
+    assertStrEqual(signatureOf(otherSigned), "0c5f8126866adacaf8c54472bc81e0678291d0a0a1759bc04e13e61064b6216a")
+    assertStrEqual(otherSigned.url, "https://s3.example.com/bucket/docs/a%2520b%252Bc~d.txt")
+
+    assertTrue(signatureOf(s3signed) != signatureOf(otherSigned))
+}
+
+// oracle: case=session-token. A session credential signed without
+// x-amz-security-token in SignedHeaders is rejected, and that is the usual reason
+// temporary credentials "do not work".
+fn testSessionTokenIsSignedAndSent(): void {
+    let c = Credentials.withToken(ak(), sk(), "FQoDYXdzEDMaTOKEN")
+    let req = Request.forS3("GET", "https://s3.example.com/bucket/k")
+    let signed = sign(req, c, region(), "s3", stamp())
+    assertStrEqual(signedHeadersOf(signed), "host;x-amz-content-sha256;x-amz-date;x-amz-security-token")
+    assertStrEqual(signed.header("x-amz-security-token") ?? "", "FQoDYXdzEDMaTOKEN")
+    assertStrEqual(signatureOf(signed), "381dd24bbb81f14401e9512af07185eec84590936c0b498f3456855b304e2f40")
+}
+
+// oracle: case=presign. The credential moves into the query, X-Amz-Expires is
+// required, and the signature covers the query rather than a header.
+fn testPresignedUrl(): void {
+    let req = Request.forS3("GET", "https://s3.example.com/bucket/key.txt")
+    let url = presign(req, creds(), region(), "s3", 900, stamp())
+    assertStrEqual(signatureOfUrl(url), "9328a0b10c7dbc2e53c8d802190908842f151cb8dcc1df9e7b806444e4d41bca")
+    assertContains(url, "X-Amz-Expires=900")
+    assertContains(url, "X-Amz-Credential=AKIDEXAMPLE%2F20150830%2Fus-east-1%2Fs3%2Faws4_request")
+    assertContains(url, "X-Amz-SignedHeaders=host")
+    // No Authorization header anywhere: the whole point is that a plain GET works.
+    assertFalse(url.contains("Authorization"))
+}
+
+// ── Signer: negative controls ────────────────────────────────────────────────
+
+// oracle: case=bad-secret. One byte of the secret.
+fn testBadSecretChangesSignature(): void {
+    let bad = Credentials.make(ak(), sk().substr(0, sk().len - 1) + "Z")
+    let req = Request.new("GET", "https://example.amazonaws.com/")
+    let signed = sign(req, bad, region(), "service", stamp())
+    assertStrEqual(signatureOf(signed), "ec97be0b584545d1eda0120dff017a6135fc6e8b013ade32e7ed04dde033669e")
+    assertTrue(signatureOf(signed) != "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+}
+
+// oracle: case=bad-path. One character of the canonical request.
+fn testBadPathChangesSignature(): void {
+    let req = Request.new("GET", "https://example.amazonaws.com/x")
+    let signed = sign(req, creds(), region(), "service", stamp())
+    assertStrEqual(signatureOf(signed), "55d1588ca3afc1b214110bfc9ec9c8b224fc9fcd08bef384fafca9f1e619b523")
+    assertTrue(signatureOf(signed) != "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+}
+
+// ── Signer: units under the canonicalisation ─────────────────────────────────
+
+fn testUriEncodeFollowsAwsRules(): void {
+    // Space is %20 and never '+'; '~' is unreserved and must stay literal;
+    // '*', '(' and ')' are NOT unreserved to AWS even though some encoders leave
+    // them; hex digits are uppercase.
+    assertStrEqual(uriEncode("a b", false), "a%20b")
+    assertStrEqual(uriEncode("~-._", false), "~-._")
+    assertStrEqual(uriEncode("*()", false), "%2A%28%29")
+    assertStrEqual(uriEncode("/", false), "%2F")
+    assertStrEqual(uriEncode("/a/b", true), "/a/b")
+    assertStrEqual(uriEncode("\xff", false), "%FF")
+    assertStrEqual(uriDecode("a%20b%2Fc"), "a b/c")
+}
+
+// A URL that already carries its query must sign the same as one built with
+// addQuery — otherwise the two spellings silently produce different signatures.
+fn testQueryInUrlMatchesAddQuery(): void {
+    let a = Request.forS3("GET", "https://s3.example.com/bucket?list-type=2&prefix=a%2Fb")
+    var b = Request.forS3("GET", "https://s3.example.com/bucket")
+    b.addQuery("list-type", "2")
+    b.addQuery("prefix", "a/b")
+    assertStrEqual(signatureOf(sign(a, creds(), region(), "s3", stamp())), signatureOf(sign(b, creds(), region(), "s3", stamp())))
+}
+
+fn testUnsignedPayloadIsSentVerbatim(): void {
+    var req = Request.forS3("PUT", "https://s3.example.com/bucket/big")
+    req.setBody("this body is not hashed")
+    req.setUnsignedPayload()
+    let signed = sign(req, creds(), region(), "s3", stamp())
+    assertStrEqual(signed.header("x-amz-content-sha256") ?? "", unsignedPayload())
+    assertStrEqual(unsignedPayload(), "UNSIGNED-PAYLOAD")
+}
+
+fn testHostHeaderCarriesNonDefaultPort(): void {
+    // RFC 7230 5.4 wants the port, and SigV4 signs the Host header verbatim: a
+    // signature made over a portless Host is rejected by a server on port 9000.
+    let a = Request.forS3("GET", "http://127.0.0.1:9000/b/k")
+    assertStrEqual(sign(a, creds(), region(), "s3", stamp()).header("host") ?? "", "127.0.0.1:9000")
+    // The default port is omitted, which is equally load-bearing.
+    let b = Request.forS3("GET", "https://s3.example.com:443/b/k")
+    assertStrEqual(sign(b, creds(), region(), "s3", stamp()).header("host") ?? "", "s3.example.com")
+}
+
+// ── Credentials ──────────────────────────────────────────────────────────────
+
+fn testCredentialsFromProfileFile(): void {
+    let dir = makeTempDir("milo-aws-creds")!
+    let path = dir + "/credentials"
+    writeFile(path, "[default]\naws_access_key_id = DEFAULTKEY\naws_secret_access_key = defaultsecret\n\n; a comment\n[work]\nAWS_ACCESS_KEY_ID = WORKKEY\naws_secret_access_key = worksecret\naws_session_token = worktoken\n")!
+
+    let d = Credentials.fromFile(path, "default")!
+    assertStrEqual(d.accessKey, "DEFAULTKEY")
+    assertStrEqual(d.secretKey, "defaultsecret")
+    assertStrEqual(d.token(), "")
+
+    // Key names are case-insensitive; the section picks the profile.
+    let w = Credentials.fromFile(path, "work")!
+    assertStrEqual(w.accessKey, "WORKKEY")
+    assertStrEqual(w.token(), "worktoken")
+
+    // A profile that is not there is None, not the default profile's keys.
+    assertTrue(Credentials.fromFile(path, "nope").isNone())
+    removeFile(path)!
+}
+
+fn testEnvCredentialsNeedBothHalves(): void {
+    Env.set("AWS_ACCESS_KEY_ID", "ENVKEY")!
+    Env.remove("AWS_SECRET_ACCESS_KEY")!
+    // Half a pair is a misconfiguration. Treating it as "nothing here" and
+    // falling through to a profile would sign with keys the operator did not pick.
+    assertTrue(Credentials.fromEnv().isNone())
+
+    Env.set("AWS_SECRET_ACCESS_KEY", "envsecret")!
+    let c = Credentials.fromEnv()!
+    assertStrEqual(c.accessKey, "ENVKEY")
+    assertStrEqual(c.secretKey, "envsecret")
+    Env.remove("AWS_ACCESS_KEY_ID")!
+    Env.remove("AWS_SECRET_ACCESS_KEY")!
+}

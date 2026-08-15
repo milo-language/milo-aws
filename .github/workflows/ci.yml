@@ -6,7 +6,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # The signer half. No server, no credentials, no network — SigV4 is a pure
+  # function of its inputs, so this job is the one that must never be skipped.
+  signer:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,13 +21,105 @@ jobs:
           chmod +x "$HOME/.milo-bin/milo"
           echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
 
-      - name: Unit tests
-        run: milo test tests/yaml_test.milo
+      # The oracle checks itself against AWS's published get-vanilla signature
+      # before printing anything, so a broken oracle fails here rather than
+      # blessing a broken client.
+      - name: Oracle
+        run: python3 scripts/sigv4-oracle.py | tee /tmp/oracle.txt
 
-      - name: Differential test against ruamel.yaml
+      # tests/sigv4_test.milo asserts fixed hex signatures that came from the
+      # oracle. Nothing stops them going stale, so every signature the oracle
+      # just printed has to appear in the file. Drift fails here instead of
+      # leaving the suite green against constants nothing produces any more.
+      - name: Oracle/test cross-check
         run: |
-          pip install ruamel.yaml
-          python3 scripts/oracle.py --milo "$(command -v milo)"
+          sed -n 's/.*signature=\([0-9a-f]*\).*/\1/p' /tmp/oracle.txt | while read -r sig; do
+            grep -q "$sig" tests/sigv4_test.milo || { echo "oracle signature $sig is not asserted"; exit 1; }
+          done
+
+      - name: Signer tests
+        run: milo test tests/sigv4_test.milo
+
+  # The client half, against a real S3 server. MinIO validates SigV4 for real,
+  # which is the entire reason it is here rather than a fake.
+  s3:
+    runs-on: ubuntu-latest
+
+    services:
+      minio:
+        # bitnami's image, not minio/minio, because GitHub's `services:` block
+        # has no way to pass command arguments to a container — `options` maps
+        # onto docker create flags — and minio/minio's entrypoint needs
+        # `server /data`. bitnami's starts the server from env alone.
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: miniotestkey
+          MINIO_ROOT_PASSWORD: miniotestsecret
+        # Mapped to port 80 on purpose. The released milo's std/fetch omits the
+        # port from the Host header (fixed upstream, not yet in a release), and
+        # testPresignedGetWorksWithPlainFetch fetches through std/fetch. On the
+        # default port both spellings of Host agree, so this job tests the client
+        # rather than the transport's version. The signer's own port handling is
+        # covered with no server at all by testHostHeaderCarriesNonDefaultPort.
+        ports:
+          - 80:9000
+
+    env:
+      MILO_S3_ENDPOINT: http://127.0.0.1
+      MILO_S3_KEY: miniotestkey
+      MILO_S3_SECRET: miniotestsecret
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install milo
+        run: |
+          mkdir -p "$HOME/.milo-bin"
+          curl -fsSL https://github.com/milo-language/milo/releases/download/latest/milo-linux-x64.tar.gz \
+            | tar xz -C "$HOME/.milo-bin" --strip-components=1
+          chmod +x "$HOME/.milo-bin/milo"
+          echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
+
+      # Checked, not slept. A fixed sleep races a loaded runner, and a wait with
+      # no check is the silent-success trap: it would "succeed" against a dead
+      # server and every test below would then fail for the wrong reason.
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 100); do
+            curl -fsS http://127.0.0.1/minio/health/live >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "minio never became ready"; exit 1
+
+      - name: S3 tests
+        run: milo test tests/s3_test.milo
 
       - name: Example
-        run: milo run examples/config.milo examples/app.yaml
+        env:
+          AWS_ACCESS_KEY_ID: miniotestkey
+          AWS_SECRET_ACCESS_KEY: miniotestsecret
+        run: milo run examples/s3.milo | tee /tmp/example.txt
+
+      # curl implements SigV4 independently, so it is a second signer reading the
+      # objects this client just wrote. Without it the job only proves the client
+      # agrees with itself.
+      - name: Cross-check with curl
+        run: |
+          s3get() { curl -sS --fail --aws-sigv4 "aws:amz:us-east-1:s3" \
+            --user "miniotestkey:miniotestsecret" "http://127.0.0.1/$1"; }
+          test "$(s3get milo-aws-example/notes/hello.txt)" = "hello from milo"
+          test "$(s3get milo-aws-test/roundtrip/hello.txt)" = "hello from milo"
+          # 13 bytes with NUL and 0xff in the middle, counted by a tool that is
+          # not us: a client treating the body as C text would have truncated it.
+          s3get milo-aws-test/roundtrip/binary.bin > /tmp/bin
+          test "$(wc -c < /tmp/bin | tr -d ' ')" = "13"
+          od -An -tx1 /tmp/bin | tr -d ' \n' | grep -q '00ff00'
+
+      - name: Cross-check the presigned URL with no credentials
+        run: |
+          PRESIGNED="$(sed -n 's/^presigned: //p' /tmp/example.txt)"
+          test -n "$PRESIGNED"
+          test "$(curl -sS "$PRESIGNED")" = "hello from milo"
+          # One character less of a signature must stop working, or the line
+          # above would pass against a server that ignored the query.
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "${PRESIGNED%?}")" = "403"

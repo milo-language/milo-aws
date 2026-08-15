@@ -1,0 +1,1304 @@
+// milo-aws — AWS Signature Version 4 request signing, and an S3 client on top.
+//
+// Two layers, and the signer is the one that matters: SigV4 is the same for every
+// AWS service, so `sign` works against DynamoDB, SQS or Lambda even though only
+// S3 has a client here.
+//
+//   let creds = Credentials.resolve()!
+//   let s3 = S3.new("https://s3.us-east-1.amazonaws.com", "us-east-1", creds)
+//   s3.putObject("my-bucket", "hello.txt", "hi", "text/plain")!
+//   print(s3.getObject("my-bucket", "hello.txt")!)
+//
+// `sign` and `presign` take the timestamp as a PARAMETER rather than reading the
+// clock. A signature is a pure function of its inputs, and that is the only thing
+// that makes it testable against AWS's published vectors — a signer that calls
+// the clock internally can never reproduce a fixed one. `amzNow()` is here for
+// callers who do want the current time; the S3 client calls it and passes it in.
+//
+// The derivation chain is proven in docs/sigv4-probe.milo against AWS's
+// get-vanilla vector; docs/sigv4-notes.md records why every step must key the
+// next HMAC with the RAW digest. Hexing an intermediate still yields a plausible
+// 64-character signature that AWS rejects with no hint as to which step drifted.
+
+from "std/net" import {
+    TcpStream, NetError, resolve
+}
+from "std/fetch" import {
+    TlsStream, FetchResponse, parseResponse
+}
+from "std/hmac" import {
+    Hmac
+}
+from "std/sha256" import {
+    Sha256
+}
+from "std/env" import {
+    Env
+}
+from "std/fs" import {
+    readFile
+}
+from "std/time" import {
+    epochSecs
+}
+from "std/datetime" import {
+    DateTime
+}
+from "std/html" import {
+    Html
+}
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+// Functions rather than globals: a module with no `main` cannot run a global
+// initializer, so a library's constants have to be callable.
+pub fn algorithm(): string {
+    return "AWS4-HMAC-SHA256"
+}
+
+// The payload hash that says "do not hash the body". Legal for S3 over HTTPS
+// only, and it is what makes streaming a large object possible without buffering
+// the whole thing to hash it first. Over plain HTTP it removes the only integrity
+// check the request had.
+pub fn unsignedPayload(): string {
+    return "UNSIGNED-PAYLOAD"
+}
+
+fn hexUpperDigit(v: i64): u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (55 + v) as u8
+}
+
+// ── Percent encoding ─────────────────────────────────────────────────────────
+
+// AWS's URI encoding: everything outside the unreserved set becomes %XX with
+// UPPERCASE hex. `keepSlash` leaves '/' alone — which is what a path needs and
+// what a query component must not have, because a slash inside a value has to
+// survive as %2F or it reads as a path separator.
+//
+// Note this is not `encodeURIComponent`: space is %20 and never '+', and '*',
+// '(' and ')' are encoded. Getting any of those wrong is a SignatureDoesNotMatch.
+pub fn uriEncode(s: &string, keepSlash: bool): string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < s.len {
+        let c = s[i]
+        if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' {
+            out.push(c)
+        } else if c == '/' && keepSlash {
+            out.push(c)
+        } else {
+            out.push('%')
+            out.push(hexUpperDigit((c as i64) / 16))
+            out.push(hexUpperDigit((c as i64) % 16))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hexVal(c: u8): i64 {
+    if c >= '0' && c <= '9' {
+        return (c as i64) - 48
+    }
+    if c >= 'a' && c <= 'f' {
+        return (c as i64) - 87
+    }
+    if c >= 'A' && c <= 'F' {
+        return (c as i64) - 55
+    }
+    return -1
+}
+
+// Reverse of uriEncode, used only to pull a query string apart when a caller
+// hands `Request.new` a URL that already has one. A '%' with anything but two
+// hex digits after it is left alone rather than guessed at.
+pub fn uriDecode(s: &string): string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < s.len {
+        if s[i] == '%' && i + 2 < s.len {
+            let hi = hexVal(s[i + 1])
+            let lo = hexVal(s[i + 2])
+            if hi >= 0 && lo >= 0 {
+                out.push((hi * 16 + lo) as u8)
+                i = i + 3
+                continue
+            }
+        }
+        out.push(s[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── URL pieces ───────────────────────────────────────────────────────────────
+//
+// Deliberately not std/fetch's parsers: the signer has to agree byte for byte
+// with what goes on the wire, so this package owns both ends of that.
+
+fn schemeEnd(url: &string): i64 {
+    let i = url.indexOf("://") ?? -1
+    if i < 0 {
+        return 0
+    }
+    return i + 3
+}
+
+fn authorityEnd(url: &string): i64 {
+    var i = schemeEnd(url)
+    while i < url.len && url[i] != '/' && url[i] != '?' {
+        i = i + 1
+    }
+    return i
+}
+
+fn isTls(url: &string): bool {
+    return url.startsWith("https://")
+}
+
+// The authority as the Host header must carry it: RFC 7230 5.4 wants the port
+// whenever it is not the scheme's default, and SigV4 signs this header verbatim,
+// so a Host that disagrees with the connection is a rejected request.
+pub fn hostHeaderOf(url: &string): string {
+    let auth = url.substr(schemeEnd(url), authorityEnd(url))
+    if isTls(url) && auth.endsWith(":443") {
+        return auth.substr(0, auth.len - 4)
+    }
+    if !isTls(url) && auth.endsWith(":80") {
+        return auth.substr(0, auth.len - 3)
+    }
+    return auth
+}
+
+fn hostOf(url: &string): string {
+    let auth = url.substr(schemeEnd(url), authorityEnd(url))
+    match auth.lastIndexOf(":") {
+        Option.Some(c) => {
+            return auth.substr(0, c)
+        }
+        Option.None => {
+            return auth
+        }
+    }
+}
+
+fn portOf(url: &string): u16 {
+    let auth = url.substr(schemeEnd(url), authorityEnd(url))
+    match auth.lastIndexOf(":") {
+        Option.Some(c) => {
+            let n = auth.substr(c + 1, auth.len).parseInt() ?? -1
+            if n > 0 {
+                return n as u16
+            }
+        }
+        Option.None => {
+        }
+    }
+    if isTls(url) {
+        return 443 as u16
+    }
+    return 80 as u16
+}
+
+// The path, un-encoded, as the caller wrote it. Empty means "/" — SigV4 requires
+// a canonical URI of at least a slash.
+fn pathOf(url: &string): string {
+    let start = authorityEnd(url)
+    if start >= url.len || url[start] == '?' {
+        return "/"
+    }
+    var end = start
+    while end < url.len && url[end] != '?' {
+        end = end + 1
+    }
+    return url.substr(start, end)
+}
+
+fn originOf(url: &string): string {
+    return url.substr(0, authorityEnd(url))
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+// A failure, from S3 or from this side of the socket.
+//
+// `code` is S3's error code — `NoSuchKey`, `NoSuchBucket`, `AccessDenied`,
+// `SignatureDoesNotMatch` — and it is the part a program should branch on. The
+// message is prose and gets reworded; collapsing the whole thing to one string is
+// what makes a client annoying to use. `kind` separates a server answer from a
+// local failure: "S3" came back over the wire with a status, "CLIENT" never
+// reached one, "CONFIG" means we could not even find credentials.
+pub struct AwsError {
+    kind: string,
+    code: string,
+    message: string,
+    status: i32,
+    requestId: string,
+}
+
+impl AwsError {
+    fn make(kind: &string, code: &string, message: &string): AwsError {
+        return AwsError {
+            kind: kind.clone(),
+            code: code.clone(),
+            message: message.clone(),
+            status: 0 as i32,
+            requestId: "",
+        }
+    }
+
+    // DNS, connect, TLS, a truncated response: nothing that carries an S3 code.
+    fn client(message: &string): AwsError {
+        return AwsError.make("CLIENT", "ClientError", message)
+    }
+
+    // No usable credentials anywhere in the resolution chain.
+    fn config(message: &string): AwsError {
+        return AwsError.make("CONFIG", "CredentialsNotFound", message)
+    }
+
+    fn isNotFound(self: &Self): bool {
+        return self.code == "NoSuchKey" || self.code == "NoSuchBucket" || self.code == "NotFound"
+    }
+
+    fn clone(self: &Self): AwsError {
+        return AwsError {
+            kind: self.kind.clone(),
+            code: self.code.clone(),
+            message: self.message.clone(),
+            status: self.status,
+            requestId: self.requestId.clone(),
+        }
+    }
+
+    fn toString(self: &Self): string {
+        var out = self.kind + " " + self.code
+        if self.status != 0 as i32 {
+            out = out + " (HTTP " + (self.status as i64).toString() + ")"
+        }
+        if self.message.len > 0 {
+            out = out + ": " + self.message
+        }
+        if self.requestId.len > 0 {
+            out = out + " [request " + self.requestId + "]"
+        }
+        return out
+    }
+}
+
+// ── Credentials ──────────────────────────────────────────────────────────────
+
+// An access key pair, optionally with an STS session token.
+//
+// A session token is not decoration: when present it MUST travel as
+// `x-amz-security-token` and be listed in SignedHeaders, or the request is
+// rejected. `sign` does both automatically, so a caller cannot forget.
+pub struct Credentials {
+    accessKey: string,
+    secretKey: string,
+    sessionToken: Option<string>,
+}
+
+impl Credentials {
+    fn make(accessKey: &string, secretKey: &string): Credentials {
+        return Credentials {
+            accessKey: accessKey.clone(), secretKey: secretKey.clone(), sessionToken: Option.None
+        }
+    }
+
+    fn withToken(accessKey: &string, secretKey: &string, token: &string): Credentials {
+        return Credentials {
+            accessKey: accessKey.clone(),
+            secretKey: secretKey.clone(),
+            sessionToken: Option.Some(token.clone()),
+        }
+    }
+
+    // The session token, or "" when there is none. Internal callers want the
+    // "is there one" question answered without a match at every use site.
+    fn token(self: &Self): string {
+        match self.sessionToken {
+            Option.Some(t) => {
+                return t.clone()
+            }
+            Option.None => {
+                return ""
+            }
+        }
+    }
+
+    fn clone(self: &Self): Credentials {
+        let t = self.token()
+        if t.len > 0 {
+            return Credentials.withToken(self.accessKey, self.secretKey, t)
+        }
+        return Credentials.make(self.accessKey, self.secretKey)
+    }
+
+    // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN. Both of the
+    // first two must be present: half a key pair is a misconfiguration, and
+    // treating it as "no credentials" and silently falling through to a profile
+    // would sign with something the operator did not choose.
+    fn fromEnv(): Option<Credentials> {
+        let ak = Env.getOr("AWS_ACCESS_KEY_ID", "")
+        let sk = Env.getOr("AWS_SECRET_ACCESS_KEY", "")
+        if ak.len == 0 || sk.len == 0 {
+            return Option.None
+        }
+        let tok = Env.getOr("AWS_SESSION_TOKEN", "")
+        if tok.len > 0 {
+            return Option.Some(Credentials.withToken(ak, sk, tok))
+        }
+        return Option.Some(Credentials.make(ak, sk))
+    }
+
+    // One profile out of an INI file in ~/.aws/credentials format. Sections there
+    // are bare `[name]` — the `[profile name]` spelling belongs to ~/.aws/config,
+    // which this does not read.
+    fn fromFile(path: &string, profile: &string): Option<Credentials> {
+        var text: string = ""
+        match readFile(path) {
+            Result.Ok(t) => {
+                text = t
+            }
+            Result.Err(e) => {
+                return Option.None
+            }
+        }
+        var inSection = false
+        var ak: string = ""
+        var sk: string = ""
+        var tok: string = ""
+        for raw in text.lines() {
+            let line = raw.trim()
+            if line.len == 0 || line[0] == '#' || line[0] == ';' {
+                continue
+            }
+            if line[0] == '[' {
+                let close = line.indexOf("]") ?? 0
+                if close > 1 {
+                    inSection = line.substr(1, close).trim() == profile
+                }
+                continue
+            }
+            if !inSection {
+                continue
+            }
+            let eq = line.indexOf("=") ?? -1
+            if eq < 0 {
+                continue
+            }
+            let name = line.substr(0, eq).trim().toLower()
+            let value = line.substr(eq + 1, line.len).trim()
+            if name == "aws_access_key_id" {
+                ak = value.clone()
+            } else if name == "aws_secret_access_key" {
+                sk = value.clone()
+            } else if name == "aws_session_token" {
+                tok = value.clone()
+            }
+        }
+        if ak.len == 0 || sk.len == 0 {
+            return Option.None
+        }
+        if tok.len > 0 {
+            return Option.Some(Credentials.withToken(ak, sk, tok))
+        }
+        return Option.Some(Credentials.make(ak, sk))
+    }
+
+    // Environment first, then the shared credentials file under AWS_PROFILE.
+    // Explicit credentials are the caller's own business and never come through
+    // here — that is the "explicit > env > file" order, with the first step being
+    // "do not call this".
+    //
+    // Instance roles (IMDSv2) and AssumeRole are NOT in the chain; see the README.
+    // They are absent rather than stubbed, so a machine that expects an instance
+    // role fails with a message saying where it looked.
+    fn resolve(): Result<Credentials, AwsError> {
+        match Credentials.fromEnv() {
+            Option.Some(c) => {
+                return Result.Ok(c)
+            }
+            Option.None => {
+            }
+        }
+        let profile = Env.getOr("AWS_PROFILE", "default")
+        let home = Env.getOr("HOME", "")
+        let path = Env.getOr("AWS_SHARED_CREDENTIALS_FILE", home + "/.aws/credentials")
+        match Credentials.fromFile(path, profile) {
+            Option.Some(c) => {
+                return Result.Ok(c)
+            }
+            Option.None => {
+            }
+        }
+        return Result.Err(AwsError.config("no credentials in AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or profile '" + profile + "' of " + path))
+    }
+}
+
+// ── Requests ─────────────────────────────────────────────────────────────────
+
+pub struct Header {
+    name: string,
+    value: string,
+}
+
+impl Header {
+    fn make(name: &string, value: &string): Header {
+        return Header {
+            name: name.clone(), value: value.clone()
+        }
+    }
+
+    fn clone(self: &Self): Header {
+        return Header {
+            name: self.name.clone(), value: self.value.clone()
+        }
+    }
+}
+
+pub struct QueryParam {
+    name: string,
+    value: string,
+}
+
+impl QueryParam {
+    fn make(name: &string, value: &string): QueryParam {
+        return QueryParam {
+            name: name.clone(), value: value.clone()
+        }
+    }
+
+    fn clone(self: &Self): QueryParam {
+        return QueryParam {
+            name: self.name.clone(), value: self.value.clone()
+        }
+    }
+}
+
+// How many times the path is percent-encoded on the way into the canonical
+// request.
+//
+// This is an explicit choice, not something inferred from the service name,
+// because getting it wrong is the single most common cause of
+// `SignatureDoesNotMatch` and the failure gives no hint which end is wrong.
+// S3 encodes the path ONCE. Every other AWS service encodes it TWICE.
+pub enum PathEncoding {
+    Single,
+    Double,
+}
+
+// An unsigned request. `url` carries scheme, authority and the LITERAL path —
+// the signer does the encoding, so a key named `a b/c` goes in as `a b/c` and
+// comes out `/a%20b/c` on the wire. Query parameters live in `query` rather than
+// in the URL for the same reason; `Request.new` will lift a `?…` tail out of a
+// URL into `query` (percent-decoding it) so both spellings work.
+pub struct Request {
+    method: string,
+    url: string,
+    query: Vec<QueryParam>,
+    headers: Vec<Header>,
+    body: string,
+    // None hashes the body; Some(unsignedPayload()) skips it.
+    payloadHash: Option<string>,
+    pathEncoding: PathEncoding,
+    // Whether to send and sign x-amz-content-sha256. S3 requires it; adding it
+    // for other services would change their signatures, so it is off by default.
+    sendContentSha256: bool,
+}
+
+impl Request {
+    // A request for any service EXCEPT S3: double path encoding, no
+    // x-amz-content-sha256 header.
+    fn new(method: &string, url: &string): Request {
+        return Request.build(method, url, PathEncoding.Double, false)
+    }
+
+    // A request for S3: single path encoding, x-amz-content-sha256 sent and
+    // signed.
+    fn forS3(method: &string, url: &string): Request {
+        return Request.build(method, url, PathEncoding.Single, true)
+    }
+
+    fn build(method: &string, url: &string, enc: PathEncoding, contentSha: bool): Request {
+        var r = Request {
+            method: method.toUpper(),
+            url: url.clone(),
+            query: [],
+            headers: [],
+            body: "",
+            payloadHash: Option.None,
+            pathEncoding: enc,
+            sendContentSha256: contentSha,
+        }
+        let q = url.indexOf("?") ?? -1
+        if q >= 0 {
+            r.url = url.substr(0, q)
+            let tail = url.substr(q + 1, url.len)
+            for part in tail.splitView("&") {
+                if part.len == 0 {
+                    continue
+                }
+                match part.indexOf("=") {
+                    Option.Some(eq) => {
+                        r.query.push(QueryParam.make(uriDecode(part.substr(0, eq)), uriDecode(part.substr(eq + 1, part.len))))
+                    }
+                    Option.None => {
+                        r.query.push(QueryParam.make(uriDecode(part), ""))
+                    }
+                }
+            }
+        }
+        return r
+    }
+
+    fn setHeader(self: &mut Self, name: &string, value: &string): void {
+        self.headers.push(Header.make(name, value))
+    }
+
+    fn addQuery(self: &mut Self, name: &string, value: &string): void {
+        self.query.push(QueryParam.make(name, value))
+    }
+
+    fn setBody(self: &mut Self, body: &string): void {
+        self.body = body.clone()
+    }
+
+    // Sign without hashing the body. S3 over HTTPS only — over plain HTTP this
+    // drops the request's only integrity check.
+    fn setUnsignedPayload(self: &mut Self): void {
+        self.payloadHash = Option.Some(unsignedPayload())
+    }
+
+    fn payload(self: &Self): string {
+        match self.payloadHash {
+            Option.Some(h) => {
+                return h.clone()
+            }
+            Option.None => {
+                return Sha256.hash(self.body)
+            }
+        }
+    }
+}
+
+// A request with an Authorization header (or presigned query) attached. `headers`
+// is everything that must go on the wire, Host included — a Host the server does
+// not receive verbatim is a rejected signature, so it is part of the result
+// rather than something the transport is trusted to reproduce.
+pub struct SignedRequest {
+    method: string,
+    url: string,
+    headers: Vec<Header>,
+    body: string,
+}
+
+impl SignedRequest {
+    fn header(self: &Self, name: &string): Option<string> {
+        let want = name.toLower()
+        for h in self.headers {
+            if h.name.toLower() == want {
+                return Option.Some(h.value.clone())
+            }
+        }
+        return Option.None
+    }
+}
+
+// ── Canonicalisation ─────────────────────────────────────────────────────────
+
+// Byte-wise string compare. SigV4 sorts by raw bytes, not by locale or by any
+// case-insensitive rule, and both header names and encoded query components are
+// already normalised by the time they get here.
+fn cmpBytes(a: &string, b: &string): i32 {
+    var i: i64 = 0
+    while i < a.len && i < b.len {
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return -1 as i32
+            }
+            return 1 as i32
+        }
+        i = i + 1
+    }
+    if a.len < b.len {
+        return -1 as i32
+    }
+    if a.len > b.len {
+        return 1 as i32
+    }
+    return 0 as i32
+}
+
+fn cmpQueryParam(a: &QueryParam, b: &QueryParam): i32 {
+    let byName = cmpBytes(a.name, b.name)
+    if byName != 0 as i32 {
+        return byName
+    }
+    return cmpBytes(a.value, b.value)
+}
+
+// Trim, then collapse each internal whitespace run to one space. AWS exempts runs
+// inside a quoted string; no header this package sends contains one, and doing it
+// unconditionally is the conservative direction — it can only differ on a header
+// the caller supplied with embedded quotes, which the README calls out.
+fn collapseWhitespace(v: &string): string {
+    var out: string = ""
+    var pendingSpace = false
+    var started = false
+    var i: i64 = 0
+    while i < v.len {
+        let c = v[i]
+        if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+            if started {
+                pendingSpace = true
+            }
+        } else {
+            if pendingSpace {
+                out.push(' ')
+                pendingSpace = false
+            }
+            started = true
+            out.push(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Lowercase every name, normalise every value, sort by name, and merge repeats of
+// the same name into one comma-joined value — all four are required, and the
+// merge is the one people forget.
+pub fn canonicalHeaders(headers: &Vec<Header>): Vec<Header> {
+    var norm: Vec<Header> = []
+    for h in headers {
+        norm.push(Header {
+            name: h.name.trim().toLower(), value: collapseWhitespace(h.value)
+        }
+        )
+    }
+    norm.sortBy((a: &Header, b: &Header) => cmpBytes(a.name, b.name))
+
+    var merged: Vec<Header> = []
+    var i: i64 = 0
+    while i < norm.len() {
+        let name = norm[i].name.clone()
+        var value = norm[i].value.clone()
+        var j = i + 1
+        while j < norm.len() && norm[j].name == name {
+            value = value + "," + norm[j].value
+            j = j + 1
+        }
+        merged.push(Header {
+            name: name, value: value
+        }
+        )
+        i = j
+    }
+    return merged
+}
+
+// name=value pairs, each half encoded, sorted by encoded name then encoded value.
+// An empty value still gets its '=' — dropping it is a different canonical string
+// and therefore a different signature.
+pub fn canonicalQuery(query: &Vec<QueryParam>): string {
+    var enc: Vec<QueryParam> = []
+    for q in query {
+        enc.push(QueryParam {
+            name: uriEncode(q.name, false), value: uriEncode(q.value, false)
+        }
+        )
+    }
+    enc.sortBy((a: &QueryParam, b: &QueryParam) => cmpQueryParam(a, b))
+
+    var out: string = ""
+    var i: i64 = 0
+    while i < enc.len() {
+        if i > 0 {
+            out.push('&')
+        }
+        out.pushStr(enc[i].name)
+        out.push('=')
+        out.pushStr(enc[i].value)
+        i = i + 1
+    }
+    return out
+}
+
+pub fn canonicalPath(path: &string, encoding: &PathEncoding): string {
+    if path.len == 0 {
+        return "/"
+    }
+    let once = uriEncode(path, true)
+    let double = match encoding {
+        PathEncoding.Double => {
+            true
+        }
+        PathEncoding.Single => {
+            false
+        }
+    }
+    if double {
+        return uriEncode(once, true)
+    }
+    return once
+}
+
+// The four-step key derivation. Each step keys the next HMAC with the previous
+// RAW digest — see docs/sigv4-notes.md for why a hexed intermediate is the
+// classic silent failure.
+pub fn signingKey(secret: &string, dateStamp: &string, region: &string, service: &string): string {
+    var k = Hmac.sha256Bytes("AWS4" + secret, dateStamp)
+    k = Hmac.sha256Bytes(k, region)
+    k = Hmac.sha256Bytes(k, service)
+    return Hmac.sha256Bytes(k, "aws4_request")
+}
+
+fn credentialScope(dateStamp: &string, region: &string, service: &string): string {
+    return dateStamp + "/" + region + "/" + service + "/aws4_request"
+}
+
+fn headerBlock(headers: &Vec<Header>): string {
+    var out: string = ""
+    for h in headers {
+        out.pushStr(h.name)
+        out.push(':')
+        out.pushStr(h.value)
+        out.push('\n')
+    }
+    return out
+}
+
+fn signedHeaderList(headers: &Vec<Header>): string {
+    var out: string = ""
+    for h in headers {
+        if out.len > 0 {
+            out.push(';')
+        }
+        out.pushStr(h.name)
+    }
+    return out
+}
+
+// ── Signing ──────────────────────────────────────────────────────────────────
+
+// `now` is `YYYYMMDDTHHMMSSZ` — AWS's basic-format ISO 8601, no punctuation.
+pub fn amzTime(epochSec: i64): string {
+    let d = DateTime.fromEpoch(epochSec)
+    var out: string = ""
+    out.pushStr((d.year as i64).toString().padStart(4, "0"))
+    out.pushStr((d.month as i64).toString().padStart(2, "0"))
+    out.pushStr((d.day as i64).toString().padStart(2, "0"))
+    out.push('T')
+    out.pushStr((d.hour as i64).toString().padStart(2, "0"))
+    out.pushStr((d.minute as i64).toString().padStart(2, "0"))
+    out.pushStr((d.second as i64).toString().padStart(2, "0"))
+    out.push('Z')
+    return out
+}
+
+pub fn amzNow(): string {
+    return amzTime(epochSecs())
+}
+
+// Every header the signer will sign: the caller's, plus the ones SigV4 requires.
+// Host is always signed. `x-amz-security-token` is added whenever the credentials
+// carry one — a session credential signed without it is rejected, and forgetting
+// it is the usual reason temporary credentials "do not work".
+fn requestHeaders(req: &Request, creds: &Credentials, now: &string, payload: &string): Vec<Header> {
+    var hs: Vec<Header> = []
+    hs.push(Header.make("host", hostHeaderOf(req.url)))
+    hs.push(Header.make("x-amz-date", now))
+    for h in req.headers {
+        hs.push(h.clone())
+    }
+    if req.sendContentSha256 {
+        hs.push(Header.make("x-amz-content-sha256", payload))
+    }
+    let tok = creds.token()
+    if tok.len > 0 {
+        hs.push(Header.make("x-amz-security-token", tok))
+    }
+    return hs
+}
+
+// The canonical request, exactly as it is hashed. Public because it is the thing
+// you diff against AWS's error message when a signature is refused — AWS echoes
+// the canonical request it computed, and the first differing line names the bug.
+pub fn canonicalRequest(method: &string, path: &string, encoding: &PathEncoding, query: &Vec<QueryParam>, headers: &Vec<Header>, payload: &string): string {
+    var out = method.clone()
+    out.push('\n')
+    out.pushStr(canonicalPath(path, encoding))
+    out.push('\n')
+    out.pushStr(canonicalQuery(query))
+    out.push('\n')
+    out.pushStr(headerBlock(headers))
+    out.push('\n')
+    out.pushStr(signedHeaderList(headers))
+    out.push('\n')
+    out.pushStr(payload)
+    return out
+}
+
+pub fn stringToSign(now: &string, scope: &string, canonical: &string): string {
+    return algorithm() + "\n" + now + "\n" + scope + "\n" + Sha256.hash(canonical)
+}
+
+// Sign a request with an Authorization header.
+//
+// `now` is a parameter on purpose — see the file header. Pass `amzNow()` in
+// production and a fixed stamp in a test.
+pub fn sign(req: &Request, creds: &Credentials, region: &string, service: &string, now: &string): SignedRequest {
+    let payload = req.payload()
+    let all = requestHeaders(req, creds, now, payload)
+    let canon = canonicalHeaders(all)
+    let creq = canonicalRequest(req.method, pathOf(req.url), req.pathEncoding, req.query, canon, payload)
+
+    let dateStamp = now.substr(0, 8)
+    let scope = credentialScope(dateStamp, region, service)
+    let sig = Hmac.sha256(signingKey(creds.secretKey, dateStamp, region, service), stringToSign(now, scope, creq))
+
+    var headers: Vec<Header> = []
+    for h in canon {
+        headers.push(h.clone())
+    }
+    headers.push(Header.make("authorization", algorithm() + " Credential=" + creds.accessKey + "/" + scope + ", SignedHeaders=" + signedHeaderList(canon) + ", Signature=" + sig))
+
+    var url = originOf(req.url) + canonicalPath(pathOf(req.url), req.pathEncoding)
+    let cq = canonicalQuery(req.query)
+    if cq.len > 0 {
+        url = url + "?" + cq
+    }
+    return SignedRequest {
+        method: req.method.clone(), url: url, headers: headers, body: req.body.clone()
+    }
+}
+
+// Sign a request as a URL that carries its own credential.
+//
+// The credential, the timestamp and the expiry move into the query string, the
+// payload is UNSIGNED-PAYLOAD, and the signature covers the query rather than an
+// Authorization header. Only `host` is signed unless the caller added headers —
+// anything signed here must also be sent by whoever fetches the URL, and a
+// browser will not send an `x-amz-*` header for you.
+pub fn presign(req: &Request, creds: &Credentials, region: &string, service: &string, expiresSecs: i64, now: &string): string {
+    let dateStamp = now.substr(0, 8)
+    let scope = credentialScope(dateStamp, region, service)
+
+    var hs: Vec<Header> = []
+    hs.push(Header.make("host", hostHeaderOf(req.url)))
+    for h in req.headers {
+        hs.push(h.clone())
+    }
+    let canon = canonicalHeaders(hs)
+    let signedList = signedHeaderList(canon)
+
+    var query: Vec<QueryParam> = []
+    for q in req.query {
+        query.push(q.clone())
+    }
+    query.push(QueryParam.make("X-Amz-Algorithm", algorithm()))
+    query.push(QueryParam.make("X-Amz-Credential", creds.accessKey + "/" + scope))
+    query.push(QueryParam.make("X-Amz-Date", now))
+    query.push(QueryParam.make("X-Amz-Expires", expiresSecs.toString()))
+    query.push(QueryParam.make("X-Amz-SignedHeaders", signedList))
+    let tok = creds.token()
+    if tok.len > 0 {
+        query.push(QueryParam.make("X-Amz-Security-Token", tok))
+    }
+
+    let creq = canonicalRequest(req.method, pathOf(req.url), req.pathEncoding, query, canon, unsignedPayload())
+    let sig = Hmac.sha256(signingKey(creds.secretKey, dateStamp, region, service), stringToSign(now, scope, creq))
+    return originOf(req.url) + canonicalPath(pathOf(req.url), req.pathEncoding) + "?" + canonicalQuery(query) + "&X-Amz-Signature=" + sig
+}
+
+// ── Transport ────────────────────────────────────────────────────────────────
+//
+// A signed request cannot be handed to a general-purpose HTTP client: the client
+// would have to reproduce the Host header byte for byte and must not follow a
+// redirect (the signature is bound to the host it was made for). So this package
+// serialises the request itself and only reuses std/fetch's response parser.
+// `sendSigned` rather than `send`: Milo has one flat namespace, and a package
+// exporting a name that generic would collide with half its callers.
+
+fn requestTarget(url: &string): string {
+    let start = authorityEnd(url)
+    if start >= url.len {
+        return "/"
+    }
+    if url[start] == '?' {
+        return "/" + url.substr(start, url.len)
+    }
+    return url.substr(start, url.len)
+}
+
+fn serialize(sr: &SignedRequest): string {
+    var raw = sr.method + " " + requestTarget(sr.url) + " HTTP/1.1\r\n"
+    for h in sr.headers {
+        raw.pushStr(h.name)
+        raw.pushStr(": ")
+        raw.pushStr(h.value)
+        raw.pushStr("\r\n")
+    }
+    // Always sent, even at zero: S3 answers 411 to a PUT with no Content-Length,
+    // and an empty-bodied PUT is exactly what CreateBucket is.
+    raw.pushStr("Content-Length: ")
+    raw.pushStr(sr.body.len.toString())
+    raw.pushStr("\r\nConnection: close\r\n\r\n")
+    raw.pushStr(sr.body)
+    return raw
+}
+
+pub fn sendSigned(sr: &SignedRequest): Result<FetchResponse, AwsError> {
+    let host = hostOf(sr.url)
+    let port = portOf(sr.url)
+    let raw = serialize(sr)
+
+    var ip: u32 = 0 as u32
+    match resolve(host) {
+        Result.Ok(a) => {
+            ip = a
+        }
+        Result.Err(e) => {
+            return Result.Err(AwsError.client("cannot resolve " + host))
+        }
+    }
+
+    if isTls(sr.url) {
+        var tls = TlsStream.connect(ip, port, host)
+        match tls {
+            Result.Ok(s) => {
+                match s.send(raw) {
+                    Result.Ok(n) => {
+                    }
+                    Result.Err(e) => {
+                        return Result.Err(AwsError.client("TLS send failed"))
+                    }
+                }
+                match s.recv() {
+                    Result.Ok(body) => {
+                        return Result.Ok(parseResponse(body))
+                    }
+                    Result.Err(e) => {
+                        return Result.Err(AwsError.client("TLS receive failed"))
+                    }
+                }
+            }
+            Result.Err(e) => {
+                return Result.Err(AwsError.client("TLS connect to " + host + " failed"))
+            }
+        }
+    }
+
+    match TcpStream.connect(ip, port) {
+        Result.Ok(s) => {
+            match s.send(raw) {
+                Result.Ok(n) => {
+                }
+                Result.Err(e) => {
+                    return Result.Err(AwsError.client("send failed"))
+                }
+            }
+            match s.recv() {
+                Result.Ok(body) => {
+                    return Result.Ok(parseResponse(body))
+                }
+                Result.Err(e) => {
+                    return Result.Err(AwsError.client("receive failed"))
+                }
+            }
+        }
+        Result.Err(e) => {
+            return Result.Err(AwsError.client("connect to " + host + " failed"))
+        }
+    }
+}
+
+// ── S3 XML ───────────────────────────────────────────────────────────────────
+//
+// S3 answers in XML, and the shapes this client needs are flat: a handful of
+// leaf elements inside a known parent. A general XML parser would be a package of
+// its own, so this extracts named leaves and unescapes their text — which is
+// exactly as much as ListObjectsV2 and the Error document require. Anything
+// nested or attribute-bearing is out of reach, and the README says so.
+
+fn tagValueIn(xml: &string, tag: &string, from: i64, until: i64): string {
+    let open = "<" + tag + ">"
+    let close = "</" + tag + ">"
+    let a = xml.indexOfFrom(open, from) ?? -1
+    if a < 0 || a >= until {
+        return ""
+    }
+    let vStart = a + open.len
+    let b = xml.indexOfFrom(close, vStart) ?? -1
+    if b < 0 || b > until {
+        return ""
+    }
+    return Html.unescape(xml.substr(vStart, b))
+}
+
+fn tagValue(xml: &string, tag: &string): string {
+    return tagValueIn(xml, tag, 0, xml.len)
+}
+
+// ── S3 ───────────────────────────────────────────────────────────────────────
+
+// One object's metadata. `etag` keeps S3's quotes stripped; `lastModified` is
+// left as the server's ISO 8601 string rather than parsed, because S3 uses two
+// different formats across APIs and guessing wrong would silently shift a time.
+pub struct ObjectMeta {
+    key: string,
+    size: i64,
+    etag: string,
+    lastModified: string,
+    contentType: string,
+}
+
+impl ObjectMeta {
+    fn clone(self: &Self): ObjectMeta {
+        return ObjectMeta {
+            key: self.key.clone(),
+            size: self.size,
+            etag: self.etag.clone(),
+            lastModified: self.lastModified.clone(),
+            contentType: self.contentType.clone(),
+        }
+    }
+
+    fn toString(self: &Self): string {
+        return self.key + " (" + self.size.toString() + " bytes, etag " + self.etag + ")"
+    }
+}
+
+fn stripQuotes(s: &string): string {
+    if s.len >= 2 && s[0] == '"' && s[s.len - 1] == '"' {
+        return s.substr(1, s.len - 1)
+    }
+    return s.clone()
+}
+
+// An S3 endpoint plus the credentials to sign for it.
+//
+// Addressing is PATH style — `https://host/bucket/key`. That is what works
+// against MinIO and against an endpoint given as an IP, and it works against AWS
+// too. Virtual-hosted addressing (`https://bucket.host/key`) is not implemented.
+pub struct S3 {
+    endpoint: string,
+    region: string,
+    creds: Credentials,
+}
+
+impl S3 {
+    fn new(endpoint: &string, region: &string, creds: Credentials): S3 {
+        var e = endpoint.clone()
+        while e.len > 0 && e[e.len - 1] == '/' {
+            e = e.substr(0, e.len - 1)
+        }
+        return S3 {
+            endpoint: e, region: region.clone(), creds: creds
+        }
+    }
+
+    fn objectUrl(self: &Self, bucket: &string, key: &string): string {
+        return self.endpoint + "/" + bucket + "/" + key
+    }
+
+    fn bucketUrl(self: &Self, bucket: &string): string {
+        return self.endpoint + "/" + bucket
+    }
+
+    fn signed(self: &Self, req: &Request): SignedRequest {
+        return sign(req, self.creds, self.region, "s3", amzNow())
+    }
+
+    // Turn a non-2xx response into a typed error. S3's body is an <Error>
+    // document with a stable Code; a HEAD has no body at all, so the status is
+    // mapped to the code S3 would have sent. Returning the raw body as a string
+    // would make `NoSuchKey` indistinguishable from a network hiccup.
+    fn errorFrom(self: &Self, resp: &FetchResponse, fallbackKey: &string): AwsError {
+        var e = AwsError.make("S3", "", "")
+        e.status = resp.status
+        e.code = tagValue(resp.body, "Code")
+        e.message = tagValue(resp.body, "Message")
+        e.requestId = tagValue(resp.body, "RequestId")
+        if e.code.len == 0 {
+            if resp.status == 404 as i32 {
+                e.code = if fallbackKey.len > 0 {
+                    "NoSuchKey"
+                } else {
+                    "NoSuchBucket"
+                }
+            } else if resp.status == 403 as i32 {
+                e.code = "AccessDenied"
+            } else {
+                e.code = "HttpError"
+            }
+        }
+        if e.message.len == 0 {
+            e.message = "HTTP " + (resp.status as i64).toString()
+        }
+        return e
+    }
+
+    fn putObject(self: &Self, bucket: &string, key: &string, body: &string, contentType: &string): Result<Unit, AwsError> {
+        var req = Request.forS3("PUT", self.objectUrl(bucket, key))
+        if contentType.len > 0 {
+            req.setHeader("content-type", contentType)
+        }
+        req.setBody(body)
+        let resp = sendSigned(self.signed(req))?
+        if !resp.ok() {
+            return Result.Err(self.errorFrom(resp, key))
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    fn getObject(self: &Self, bucket: &string, key: &string): Result<string, AwsError> {
+        let req = Request.forS3("GET", self.objectUrl(bucket, key))
+        let resp = sendSigned(self.signed(req))?
+        if !resp.ok() {
+            return Result.Err(self.errorFrom(resp, key))
+        }
+        return Result.Ok(resp.body.clone())
+    }
+
+    fn headObject(self: &Self, bucket: &string, key: &string): Result<ObjectMeta, AwsError> {
+        let req = Request.forS3("HEAD", self.objectUrl(bucket, key))
+        let resp = sendSigned(self.signed(req))?
+        if !resp.ok() {
+            return Result.Err(self.errorFrom(resp, key))
+        }
+        let len = resp.header("Content-Length") ?? "0"
+        let etag = resp.header("ETag") ?? ""
+        let modified = resp.header("Last-Modified") ?? ""
+        let ctype = resp.header("Content-Type") ?? ""
+        return Result.Ok(ObjectMeta {
+            key: key.clone(),
+            size: len.trim().parseInt() ?? 0,
+            etag: stripQuotes(etag.trim()),
+            lastModified: modified.trim(),
+            contentType: ctype.trim(),
+        }
+        )
+    }
+
+    fn deleteObject(self: &Self, bucket: &string, key: &string): Result<Unit, AwsError> {
+        let req = Request.forS3("DELETE", self.objectUrl(bucket, key))
+        let resp = sendSigned(self.signed(req))?
+        // S3 answers 204 for a delete, and 204 for deleting something that was
+        // never there. Delete is idempotent by design; that is not an error.
+        if !resp.ok() && resp.status != 404 as i32 {
+            return Result.Err(self.errorFrom(resp, key))
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // Every object under `prefix`, following continuation tokens to the end.
+    //
+    // The pagination is not optional politeness: S3 caps a page at 1000 keys and
+    // says so with IsTruncated, and a client that ignored it would return a
+    // short list that looks exactly like a correct one.
+    fn listObjectsV2(self: &Self, bucket: &string, prefix: &string): Result<Vec<ObjectMeta>, AwsError> {
+        var out: Vec<ObjectMeta> = []
+        var token: string = ""
+        var more = true
+        while more {
+            var req = Request.forS3("GET", self.bucketUrl(bucket))
+            req.addQuery("list-type", "2")
+            if prefix.len > 0 {
+                req.addQuery("prefix", prefix)
+            }
+            if token.len > 0 {
+                req.addQuery("continuation-token", token)
+            }
+            let resp = sendSigned(self.signed(req))?
+            if !resp.ok() {
+                return Result.Err(self.errorFrom(resp, ""))
+            }
+            let xml = resp.body.clone()
+            var pos: i64 = 0
+            while true {
+                let a = xml.indexOfFrom("<Contents>", pos) ?? -1
+                if a < 0 {
+                    break
+                }
+                let b = xml.indexOfFrom("</Contents>", a) ?? -1
+                if b < 0 {
+                    break
+                }
+                out.push(ObjectMeta {
+                    key: tagValueIn(xml, "Key", a, b),
+                    size: tagValueIn(xml, "Size", a, b).parseInt() ?? 0,
+                    etag: stripQuotes(tagValueIn(xml, "ETag", a, b)),
+                    lastModified: tagValueIn(xml, "LastModified", a, b),
+                    contentType: "",
+                }
+                )
+                pos = b + 1
+            }
+            more = tagValue(xml, "IsTruncated") == "true"
+            if more {
+                token = tagValue(xml, "NextContinuationToken")
+                if token.len == 0 {
+                    // Truncated with no token to continue from: returning what we
+                    // have would be a silently short list, so say so instead.
+                    return Result.Err(AwsError.make("S3", "InvalidResponse", "IsTruncated with no NextContinuationToken"))
+                }
+            }
+        }
+        return Result.Ok(out)
+    }
+
+    fn createBucket(self: &Self, bucket: &string): Result<Unit, AwsError> {
+        var req = Request.forS3("PUT", self.bucketUrl(bucket))
+        // us-east-1 is the one region whose name must NOT appear in a
+        // CreateBucketConfiguration; sending it there is InvalidLocationConstraint.
+        if self.region != "us-east-1" {
+            req.setBody("<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>" + self.region + "</LocationConstraint></CreateBucketConfiguration>")
+            req.setHeader("content-type", "application/xml")
+        }
+        let resp = sendSigned(self.signed(req))?
+        if !resp.ok() {
+            let e = self.errorFrom(resp, "")
+            // Owning the bucket already is the state the caller asked for.
+            if e.code == "BucketAlreadyOwnedByYou" {
+                return Result.Ok(Unit {
+                }
+                )
+            }
+            return Result.Err(e)
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    fn bucketExists(self: &Self, bucket: &string): Result<bool, AwsError> {
+        let req = Request.forS3("HEAD", self.bucketUrl(bucket))
+        let resp = sendSigned(self.signed(req))?
+        if resp.ok() {
+            return Result.Ok(true)
+        }
+        if resp.status == 404 as i32 {
+            return Result.Ok(false)
+        }
+        // 403 is NOT "no": the bucket exists and belongs to someone else, and
+        // answering false would send the caller off to create it.
+        return Result.Err(self.errorFrom(resp, ""))
+    }
+
+    // A URL anyone can GET, with no credentials, until it expires. `now` is taken
+    // rather than read so the caller can test it; `amzNow()` is the live answer.
+    fn presignGet(self: &Self, bucket: &string, key: &string, expiresSecs: i64, now: &string): string {
+        let req = Request.forS3("GET", self.objectUrl(bucket, key))
+        return presign(req, self.creds, self.region, "s3", expiresSecs, now)
+    }
+}

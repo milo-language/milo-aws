@@ -51,6 +51,29 @@ the *canonicalisation* rules, none of which the probe exercises:
 * **Presigned URLs** move the credential into the query string and require
   `X-Amz-Expires`; the signature covers the query, not a header.
 
+## Where all of this ended up
+
+The list above is now implemented in `lib.milo` and pinned by
+`tests/sigv4_test.milo`. Two things are worth knowing before changing any of it:
+
+* **The path-encoding rule is a constructor, not an inference.** `Request.forS3`
+  encodes once, `Request.new` encodes twice. Nothing derives it from the service
+  string passed to `sign` — a wrong answer there should look like a choice
+  somebody made, not an accident.
+* **The expected signatures in the suite are not hand-written.**
+  `scripts/sigv4-oracle.py` grew from the get-vanilla check into a full
+  independent implementation and prints one signature per case;
+  `scripts/run-tests.sh` greps every one of them out of the test file. If the two
+  ever drift, the gate fails rather than the suite quietly asserting constants
+  nothing produces any more.
+
+One bug found on the way, in the compiler's own stdlib rather than here:
+`std/fetch` built its `Host` header without the port, so every request to a
+non-default port sent `Host: 127.0.0.1` for a connection to `127.0.0.1:59000`.
+RFC 7230 §5.4 requires the port, and SigV4 signs the header verbatim — so a
+signature made over the correct authority is rejected by the server that received
+the wrong one. Fixed upstream with `hostHeader()`.
+
 ## Testing without an AWS account
 
 The published test vectors are the gate — no credentials needed. MinIO can serve
