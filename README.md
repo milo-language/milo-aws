@@ -31,7 +31,7 @@ Full API, the canonicalisation rules, the credential chain and error kinds:
 ## Installation
 
 ```bash
-milo add github.com/milo-language/milo-aws
+milo pkg add github.com/milo-language/milo-aws
 ```
 
 ```milo
